@@ -9,6 +9,26 @@ from email_repair import generated_variants, word_count
 
 
 class EmailToneAuditTests(unittest.TestCase):
+    def test_standard_business_greetings_are_accepted(self):
+        for greeting in ("Hi John,", "Hello John,", "Dear Mr Rodriguez Bolinaga,"):
+            with self.subTest(greeting=greeting):
+                audit = audit_email_tone({
+                    "id": "lead_1",
+                    "name": "Acme",
+                    "email_variants": [{"label": "A", "body": f"{greeting}\n\nA concise note."}],
+                })
+                codes = {flag["code"] for flag in audit["variant_checks"][0]["flags"]}
+                self.assertNotIn("missing_greeting", codes)
+
+    def test_body_without_greeting_is_flagged(self):
+        audit = audit_email_tone({
+            "id": "lead_1",
+            "name": "Acme",
+            "email_variants": [{"label": "A", "body": "A concise note without a salutation."}],
+        })
+        codes = {flag["code"] for flag in audit["variant_checks"][0]["flags"]}
+        self.assertIn("missing_greeting", codes)
+
     def test_bad_greeting_and_word_count_are_flagged(self):
         body = "Hi The,\n\n" + " ".join(["Specific"] * 81) + "\n\nWorth a conversation?"
         audit = audit_email_tone({

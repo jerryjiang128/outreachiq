@@ -412,7 +412,7 @@ def _extract_variants(lead: dict) -> tuple[str, list[dict]]:
 
 def _audit_greeting(body: str, lead: dict, flags: list[dict]) -> None:
     first_line = _first_non_empty_line(body)
-    match = re.match(r"^Hi\s*([^,\n!]+)?[,!]", first_line, re.IGNORECASE)
+    match = re.match(r"^(?:Hi|Hello|Dear)\s*([^,\n!]+)?[,!]", first_line, re.IGNORECASE)
     if not match:
         _add_flag(flags, "missing_greeting", "needs_review", "Use a confident first name or Hi team.")
         return
