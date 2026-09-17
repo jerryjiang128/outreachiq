@@ -6,6 +6,8 @@ Run:  python server.py   ->   http://localhost:5001
 
 import csv
 import glob
+import hashlib
+import hmac
 import io
 import json
 import os
@@ -1367,6 +1369,12 @@ def api_email_outcome():
     except (TypeError, ValueError):
         return jsonify({"error": "variant_index must be a number"}), 400
 
+    if _is_aieos_frozen_handoff(lead):
+        operation = "manual_outcome_sent" if event == "sent" else "outcome"
+        guard_error = validate_aieos_frozen_handoff(lead, _aieos_payload(lead), operation=operation)
+        if guard_error:
+            return jsonify({"error": guard_error}), 409
+
     if event == "prepared":
         _record_send_prepared(lead, variant_index, channel or "manual")
     elif event == "sent":
@@ -1547,22 +1555,99 @@ def _approved_index(lead: dict):
 
 
 def _variant_send_payload(lead: dict, variant_index: int | None) -> dict:
-    """Return {subject, body} for the chosen variant, with signature appended."""
+    """Return the exact body that will be passed to Gmail for a chosen variant."""
     variants = lead.get("email_variants") or []
     if variants:
         if variant_index is None or variant_index < 0 or variant_index >= len(variants):
             variant_index = 0
         v = variants[variant_index]
-        subject = (v.get("subject") or lead.get("outreach_subject") or "").strip()
-        body = (v.get("body") or "").strip()
+        raw_subject = v.get("subject") or lead.get("outreach_subject") or ""
+        raw_body = v.get("body") or ""
     else:
-        subject = (lead.get("outreach_subject") or "").strip()
-        body = (lead.get("outreach_draft") or "").strip()
+        raw_subject = lead.get("outreach_subject") or ""
+        raw_body = lead.get("outreach_draft") or ""
+    if _is_aieos_frozen_handoff(lead):
+        return {"subject": raw_subject, "body": raw_body, "index": variant_index or 0}
+    subject = raw_subject.strip()
+    body = raw_body.strip()
     # Optional AI add-on: a short P.S. that rides along with the branding email.
     if body and _truthy(lead.get("ai_addon_enabled")) and (lead.get("ai_addon") or "").strip():
         body = body + "\n\n" + lead["ai_addon"].strip()
     full_body = body + "\n\n" + EMAIL_SIGNATURE if body else EMAIL_SIGNATURE
     return {"subject": subject, "body": full_body, "index": variant_index or 0}
+
+
+def _is_aieos_frozen_handoff(lead: dict) -> bool:
+    return (
+        lead.get("source_system") == "AIEOS"
+        or "aieos_handoff_manifest" in lead
+        or "aieos_handoff_signature" in lead
+        or "AIEOS_HANDOFF_V1:" in (lead.get("notes") or "")
+    )
+
+
+def _canonical_frozen_text(value: str) -> str:
+    """Canonical frozen-field representation: UTF-8 text with LF newlines."""
+    if not isinstance(value, str):
+        raise TypeError("frozen handoff values must be text")
+    return value.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _frozen_value_hash(value: str) -> str:
+    return hashlib.sha256(_canonical_frozen_text(value).encode("utf-8")).hexdigest()
+
+
+def _aieos_manifest_signature(manifest: dict) -> str | None:
+    secret = os.getenv("AIEOS_HANDOFF_HMAC_SECRET")
+    if not secret:
+        return None
+    encoded = json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hmac.new(secret.encode("utf-8"), encoded, hashlib.sha256).hexdigest()
+
+
+def _aieos_payload(lead: dict) -> dict:
+    return _variant_send_payload(lead, _approved_index(lead))
+
+
+def validate_aieos_frozen_handoff(lead: dict, payload: dict | None = None, operation: str = "initial_send") -> str | None:
+    """The only AIEOS provenance and frozen-field guard for all send/state paths."""
+    if not _is_aieos_frozen_handoff(lead):
+        return None
+    manifest = lead.get("aieos_handoff_manifest")
+    if not isinstance(manifest, dict):
+        return "AIEOS_HANDOFF_METADATA_MISSING"
+    signature = lead.get("aieos_handoff_signature")
+    expected_signature = _aieos_manifest_signature(manifest)
+    if not isinstance(signature, str) or not expected_signature:
+        return "AIEOS_HANDOFF_SIGNATURE_MISSING"
+    if not hmac.compare_digest(signature, expected_signature):
+        return "AIEOS_HANDOFF_SIGNATURE_INVALID"
+    required_identity = ("source_system", "source_lead_id", "message_version", "send_prep_id")
+    if manifest.get("source_system") != "AIEOS" or any(not isinstance(manifest.get(key), str) or not manifest[key] for key in required_identity[1:]):
+        return "AIEOS_SOURCE_IDENTITY_MISMATCH"
+    if lead.get("source_system") != manifest["source_system"]:
+        return "AIEOS_SOURCE_SYSTEM_MISMATCH"
+    if operation == "followup":
+        return "AIEOS_FOLLOWUP_NOT_AUTHORIZED"
+    if operation in {"manual_outcome_sent", "manual_status_sent"}:
+        return "AIEOS_SENT_MUTATION_REQUIRES_GMAIL_GUARD"
+    payload = payload if payload is not None else _aieos_payload(lead)
+    expected_hashes = {
+        "frozen_recipient_hash": (lead.get("contact_email") or ""),
+        "frozen_subject_hash": payload.get("subject", ""),
+        "frozen_body_hash": payload.get("body", ""),
+    }
+    for field, actual_value in expected_hashes.items():
+        expected = manifest.get(field)
+        if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+            return "AIEOS_HANDOFF_MANIFEST_TAMPERED"
+        if _frozen_value_hash(actual_value) != expected:
+            return {
+                "frozen_recipient_hash": "RECIPIENT_HASH_MISMATCH",
+                "frozen_subject_hash": "SUBJECT_HASH_MISMATCH",
+                "frozen_body_hash": "BODY_HASH_MISMATCH",
+            }[field]
+    return None
 
 
 def _slugify(text: str) -> str:
@@ -1775,6 +1860,15 @@ def _run_send_approved(gmail_client, limit):
             results.append({"id": lead["id"], "name": lead.get("name"), "result": "held", "reason": "daily cap reached"})
             break
 
+        idx = _approved_index(lead)
+        payload = _variant_send_payload(lead, idx)
+        guard_error = validate_aieos_frozen_handoff(lead, payload)
+        if guard_error:
+            lead["send_blocked_reason"] = guard_error
+            skipped += 1
+            results.append({"id": lead["id"], "name": lead.get("name"), "result": "skipped", "reason": guard_error})
+            continue
+
         # Idempotency: a lead that already carries a Gmail message id was sent
         # before (even if a crash left status != "sent"). Never send it again.
         if (lead.get("gmail_message_id") or "").strip():
@@ -1792,13 +1886,10 @@ def _run_send_approved(gmail_client, limit):
             results.append({"id": lead["id"], "name": lead.get("name"), "result": "skipped", "reason": reason})
             continue
 
-        idx = _approved_index(lead)
-        payload = _variant_send_payload(lead, idx)
         if not payload["subject"] or not payload["body"].strip():
             skipped += 1
             results.append({"id": lead["id"], "name": lead.get("name"), "result": "skipped", "reason": "empty subject/body"})
             continue
-
         # Throttle between actual sends (not before the first).
         if sent > 0 and SEND_DELAY_SECONDS > 0:
             time.sleep(SEND_DELAY_SECONDS)
@@ -2174,6 +2265,12 @@ def _run_send_followups(gmail_client):
             cap_reached = True
             results.append({"id": lead["id"], "name": lead.get("name"), "result": "held", "reason": "daily cap reached"})
             break
+        guard_error = validate_aieos_frozen_handoff(lead, operation="followup")
+        if guard_error:
+            lead["send_blocked_reason"] = guard_error
+            skipped += 1
+            results.append({"id": lead["id"], "name": lead.get("name"), "result": "skipped", "reason": guard_error})
+            continue
         # Idempotency: one follow-up per lead until the field is cleared.
         if (lead.get("gmail_followup_message_id") or "").strip():
             skipped += 1
@@ -2557,6 +2654,15 @@ def api_update_lead(lead_id):
         "search_mode", "market_preset", "partner_lane",
         "exclude_motion", "search_query", "search_location", "source_industry",
     }
+    if _is_aieos_frozen_handoff(lead):
+        candidate = dict(lead)
+        for key in allowed:
+            if key in data:
+                candidate[key] = data[key]
+        operation = "manual_status_sent" if candidate.get("status") == "sent" and candidate.get("status") != lead.get("status") else "lead_update"
+        guard_error = validate_aieos_frozen_handoff(candidate, _aieos_payload(candidate), operation=operation)
+        if guard_error:
+            return jsonify({"error": guard_error}), 409
     for key in allowed:
         if key in data:
             lead[key] = data[key]
@@ -2875,6 +2981,12 @@ def api_update_status():
     lead = _find(prospects, lead_id)
     if not lead:
         return jsonify({"error": "Lead not found"}), 404
+
+    if _is_aieos_frozen_handoff(lead):
+        operation = "manual_status_sent" if new_status == "sent" else "status"
+        guard_error = validate_aieos_frozen_handoff(lead, _aieos_payload(lead), operation=operation)
+        if guard_error:
+            return jsonify({"error": guard_error}), 409
 
     lead["status"] = new_status
     if new_status == "sent":
@@ -3435,6 +3547,17 @@ def api_email_import():
             if w.get("ai_addon"):
                 p["ai_addon"] = str(w["ai_addon"]).strip()
                 p["ai_addon_enabled"] = True
+            if w.get("aieos_handoff_manifest") is not None:
+                candidate = dict(p)
+                candidate["source_system"] = "AIEOS"
+                candidate["aieos_handoff_manifest"] = w["aieos_handoff_manifest"]
+                candidate["aieos_handoff_signature"] = w.get("aieos_handoff_signature")
+                metadata_error = validate_aieos_frozen_handoff(candidate, _variant_send_payload(candidate, 0))
+                if metadata_error:
+                    return jsonify({"error": metadata_error}), 400
+                p["source_system"] = "AIEOS"
+                p["aieos_handoff_manifest"] = w["aieos_handoff_manifest"]
+                p["aieos_handoff_signature"] = w["aieos_handoff_signature"]
 
             # Set status to drafted if email content was written
             has_email = w.get("variants") or w.get("sequence") or w.get("outreach_draft")
