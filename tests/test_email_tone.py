@@ -1,5 +1,6 @@
 import json
 import os
+import hashlib
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -8,7 +9,277 @@ from email_tone import audit_email_tone, audit_many_email_tones
 from email_repair import generated_variants, word_count
 
 
+def _aieos_manifest(server, lead):
+    return {
+        "source_system": "AIEOS",
+        "source_lead_id": "source-lead-1",
+        "message_version": "V1",
+        "send_prep_id": "send-prep-1",
+        "frozen_recipient_hash": server._frozen_value_hash(lead["contact_email"]),
+        "frozen_subject_hash": server._frozen_value_hash(lead["outreach_subject"]),
+        "frozen_body_hash": server._frozen_value_hash(lead["outreach_draft"]),
+    }
+
+
+def _aieos_lead(server):
+    lead = {
+        "id": "aieos_1", "name": "Acme", "status": "drafted", "priority": "warm",
+        "contact_email": "alex@example.com", "outreach_subject": "Subject",
+        "outreach_draft": "Dear Alex,\n\nA concise note.", "approved_variant": 0,
+        "source_system": "AIEOS", "ai_addon": "Must not be appended", "ai_addon_enabled": True,
+    }
+    lead["aieos_handoff_manifest"] = _aieos_manifest(server, lead)
+    lead["aieos_handoff_signature"] = server._aieos_manifest_signature(lead["aieos_handoff_manifest"])
+    lead.pop("aieos_handoff", None)
+    return lead
+
+
 class EmailToneAuditTests(unittest.TestCase):
+    def setUp(self):
+        self.secret = patch.dict(os.environ, {"AIEOS_HANDOFF_HMAC_SECRET": "unit-test-hmac-secret"})
+        self.secret.start()
+
+    def tearDown(self):
+        self.secret.stop()
+
+    def _assert_aieos_initial_send_is_fail_closed(self, mutate, expected_reason):
+        import server
+
+        class FakeGmail:
+            calls = 0
+
+            def send_email(self, **_kwargs):
+                self.calls += 1
+
+        lead = _aieos_lead(server)
+        mutate(lead)
+        gmail = FakeGmail()
+        with patch.object(server, "_load", return_value=[lead]), \
+             patch.object(server, "_load_dnc", return_value={}), \
+             patch.object(server, "_save"), \
+             patch.object(server, "_send_count_today", return_value=0), \
+             patch.object(server, "_kill_switch_on", return_value=False), \
+             server.app.test_request_context():
+            result = server._run_send_approved(gmail, limit=1).get_json()
+
+        self.assertEqual(gmail.calls, 0)
+        self.assertEqual(result["sent"], 0)
+        self.assertEqual(result["results"][0]["reason"], expected_reason)
+        self.assertEqual(lead["status"], "drafted")
+        self.assertEqual(lead["gmail_message_id"], "")
+        self.assertEqual(lead["gmail_thread_id"], "")
+        self.assertIsNone(lead["date_sent"])
+        self.assertIsNone(lead["sent_recorded_at"])
+        self.assertEqual(lead["send_channel"], "")
+        self.assertIsNone(lead["variant_sent_index"])
+
+    def test_signature_missing_blocks_initial_send_without_tracking_mutation(self):
+        self._assert_aieos_initial_send_is_fail_closed(
+            lambda lead: lead.pop("aieos_handoff_signature"),
+            "AIEOS_HANDOFF_SIGNATURE_MISSING",
+        )
+
+    def test_signature_invalid_blocks_initial_send_without_tracking_mutation(self):
+        self._assert_aieos_initial_send_is_fail_closed(
+            lambda lead: lead.__setitem__("aieos_handoff_signature", "0" * 64),
+            "AIEOS_HANDOFF_SIGNATURE_INVALID",
+        )
+
+    def test_signed_manifest_tamper_blocks_initial_send_without_tracking_mutation(self):
+        self._assert_aieos_initial_send_is_fail_closed(
+            lambda lead: lead["aieos_handoff_manifest"].__setitem__("source_lead_id", "tampered"),
+            "AIEOS_HANDOFF_SIGNATURE_INVALID",
+        )
+
+    def test_source_system_deletion_blocks_initial_send_without_downgrade(self):
+        self._assert_aieos_initial_send_is_fail_closed(
+            lambda lead: lead.pop("source_system"),
+            "AIEOS_SOURCE_SYSTEM_MISMATCH",
+        )
+
+    def test_aieos_handoff_uses_formal_metadata_not_notes(self):
+        import server
+
+        lead = _aieos_lead(server)
+        payload = server._variant_send_payload(lead, 0)
+        self.assertEqual(payload["body"], lead["outreach_draft"])
+        self.assertIsNone(server.validate_aieos_frozen_handoff(lead, payload))
+        lead["notes"] = "operator changed this note"
+        self.assertIsNone(server.validate_aieos_frozen_handoff(lead, payload))
+
+    def test_aieos_metadata_missing_or_tampered_fails_closed(self):
+        import server
+
+        lead = _aieos_lead(server)
+        payload = server._variant_send_payload(lead, 0)
+        lead["aieos_handoff_manifest"] = None
+        self.assertEqual(server.validate_aieos_frozen_handoff(lead, payload), "AIEOS_HANDOFF_METADATA_MISSING")
+        lead = _aieos_lead(server)
+        del lead["aieos_handoff_signature"]
+        self.assertEqual(server.validate_aieos_frozen_handoff(lead, payload), "AIEOS_HANDOFF_SIGNATURE_MISSING")
+        lead = _aieos_lead(server)
+        lead["aieos_handoff_signature"] = "0" * 64
+        self.assertEqual(server.validate_aieos_frozen_handoff(lead, payload), "AIEOS_HANDOFF_SIGNATURE_INVALID")
+        lead = _aieos_lead(server)
+        lead["aieos_handoff_manifest"]["source_lead_id"] = "tampered-source-lead"
+        self.assertEqual(server.validate_aieos_frozen_handoff(lead, payload), "AIEOS_HANDOFF_SIGNATURE_INVALID")
+
+    def test_aieos_source_system_cannot_downgrade_identity(self):
+        import server
+
+        for changed in (None, "Other"):
+            with self.subTest(changed=changed):
+                lead = _aieos_lead(server)
+                lead["source_system"] = changed
+                payload = server._variant_send_payload(lead, 0)
+                self.assertTrue(server._is_aieos_frozen_handoff(lead))
+                self.assertEqual(
+                    server.validate_aieos_frozen_handoff(lead, payload),
+                    "AIEOS_SOURCE_SYSTEM_MISMATCH",
+                )
+
+    def test_aieos_frozen_field_mismatches_fail_closed(self):
+        import server
+
+        for field, changed, expected in (
+            ("contact_email", "other@example.com", "RECIPIENT_HASH_MISMATCH"),
+            ("outreach_subject", "Changed", "SUBJECT_HASH_MISMATCH"),
+            ("outreach_draft", "Dear Alex,\n\nChanged.", "BODY_HASH_MISMATCH"),
+        ):
+            with self.subTest(field=field):
+                lead = _aieos_lead(server)
+                lead[field] = changed
+                payload = server._variant_send_payload(lead, 0)
+                self.assertEqual(server.validate_aieos_frozen_handoff(lead, payload), expected)
+
+    def test_non_aieos_payload_keeps_signature(self):
+        import server
+
+        lead = {"outreach_subject": "Subject", "outreach_draft": "Hi team,"}
+        with patch.object(server, "EMAIL_SIGNATURE", "Signature"):
+            self.assertEqual(server._variant_send_payload(lead, 0)["body"], "Hi team,\n\nSignature")
+
+    def test_aieos_hash_mismatch_never_calls_gmail_or_writes_sent_tracking(self):
+        import server
+
+        class FakeGmail:
+            calls = 0
+
+            def send_email(self, **_kwargs):
+                self.calls += 1
+
+        lead = _aieos_lead(server)
+        lead["outreach_draft"] = "Dear Alex,\n\nTampered."
+        client = FakeGmail()
+        with patch.object(server, "_load", return_value=[lead]), \
+             patch.object(server, "_load_dnc", return_value={}), \
+             patch.object(server, "_save"), \
+             patch.object(server, "_send_count_today", return_value=0), \
+             patch.object(server, "_kill_switch_on", return_value=False), \
+             server.app.test_request_context():
+            result = server._run_send_approved(client, limit=1).get_json()
+        self.assertEqual(client.calls, 0)
+        self.assertEqual(result["sent"], 0)
+        self.assertEqual(result["results"][0]["reason"], "BODY_HASH_MISMATCH")
+        self.assertEqual(lead["status"], "drafted")
+        self.assertEqual(lead["gmail_message_id"], "")
+        self.assertEqual(lead["gmail_thread_id"], "")
+        self.assertIsNone(lead["sent_recorded_at"])
+
+    def test_aieos_followup_and_manual_sent_paths_are_blocked(self):
+        import server
+
+        class FakeGmail:
+            calls = 0
+
+            def send_email(self, **_kwargs):
+                self.calls += 1
+
+        lead = _aieos_lead(server)
+        lead.update({"status": "sent", "gmail_thread_id": "thread-1", "follow_up_body": "Checking in."})
+        client = FakeGmail()
+        with patch.object(server, "_load", return_value=[lead]), \
+             patch.object(server, "_save"), \
+             patch.object(server, "_send_count_today", return_value=0), \
+             patch.object(server, "_kill_switch_on", return_value=False), \
+             server.app.test_request_context():
+            result = server._run_send_followups(client).get_json()
+        self.assertEqual(client.calls, 0)
+        self.assertEqual(result["results"][0]["reason"], "AIEOS_FOLLOWUP_NOT_AUTHORIZED")
+        self.assertEqual(lead["status"], "sent")
+        self.assertNotIn("gmail_followup_message_id", lead)
+
+        lead["status"] = "drafted"
+        with patch.object(server, "_load", return_value=[lead]), patch.object(server, "_save"):
+            with server.app.test_client() as client_api:
+                outcome = client_api.post("/api/email/outcome", json={"id": lead["id"], "event": "sent"})
+                status = client_api.post("/api/update-status", json={"id": lead["id"], "status": "sent"})
+        self.assertEqual(outcome.status_code, 409)
+        self.assertEqual(status.status_code, 409)
+        self.assertEqual(lead["status"], "drafted")
+
+        with patch.object(server, "_load", return_value=[lead]), patch.object(server, "_save"):
+            with server.app.test_client() as client_api:
+                direct_sent = client_api.patch(f"/api/leads/{lead['id']}", json={"status": "sent"})
+                direct_body = client_api.patch(f"/api/leads/{lead['id']}", json={"outreach_draft": "Tampered"})
+        self.assertEqual(direct_sent.status_code, 409)
+        self.assertEqual(direct_body.status_code, 409)
+        self.assertEqual(lead["status"], "drafted")
+        self.assertEqual(lead["outreach_draft"], "Dear Alex,\n\nA concise note.")
+
+    def test_source_system_failure_never_calls_gmail_or_marks_sent(self):
+        import server
+
+        class FakeGmail:
+            calls = 0
+
+            def send_email(self, **_kwargs):
+                self.calls += 1
+
+        lead = _aieos_lead(server)
+        lead["source_system"] = "Other"
+        client = FakeGmail()
+        with patch.object(server, "_load", return_value=[lead]), \
+             patch.object(server, "_load_dnc", return_value={}), \
+             patch.object(server, "_save"), \
+             patch.object(server, "_send_count_today", return_value=0), \
+             patch.object(server, "_kill_switch_on", return_value=False), \
+             server.app.test_request_context():
+            result = server._run_send_approved(client, limit=1).get_json()
+        self.assertEqual(client.calls, 0)
+        self.assertEqual(result["results"][0]["reason"], "AIEOS_SOURCE_SYSTEM_MISMATCH")
+        self.assertEqual(lead["status"], "drafted")
+        self.assertEqual(lead["gmail_message_id"], "")
+        self.assertEqual(lead["gmail_thread_id"], "")
+
+    def test_aieos_import_persists_formal_frozen_metadata(self):
+        import server
+
+        lead = {"id": "aieos_1", "status": "warm", "contact_email": "old@example.com"}
+        written_lead = {
+            "id": "aieos_1", "contact_email": "alex@example.com",
+            "outreach_subject": "Subject", "outreach_draft": "Dear Alex,\n\nA concise note.",
+        }
+        written_lead["aieos_handoff_manifest"] = _aieos_manifest(server, written_lead)
+        written_lead["aieos_handoff_signature"] = server._aieos_manifest_signature(written_lead["aieos_handoff_manifest"])
+        with tempfile.TemporaryDirectory() as directory:
+            with open(os.path.join(directory, "written.json"), "w", encoding="utf-8") as handle:
+                json.dump([written_lead], handle)
+            with patch.object(server, "DATA_DIR", directory), \
+                 patch.object(server, "_load", return_value=[lead]), \
+                 patch.object(server, "_save"), \
+                 patch.object(server, "log_api_usage"), \
+                 server.app.test_request_context():
+                result = server.api_email_import().get_json()
+        self.assertEqual(result["updated"], 1)
+        self.assertEqual(lead["source_system"], "AIEOS")
+        self.assertEqual(lead["aieos_handoff_manifest"], written_lead["aieos_handoff_manifest"])
+        self.assertEqual(lead["aieos_handoff_signature"], written_lead["aieos_handoff_signature"])
+        self.assertEqual(
+            lead["aieos_handoff_manifest"]["frozen_body_hash"],
+            server._frozen_value_hash(lead["outreach_draft"]),
+        )
+
     def test_standard_business_greetings_are_accepted(self):
         for greeting in ("Hi John,", "Hello John,", "Dear Mr Rodriguez Bolinaga,"):
             with self.subTest(greeting=greeting):
