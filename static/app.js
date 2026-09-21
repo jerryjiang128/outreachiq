@@ -880,6 +880,8 @@ async function renderSendingSection(sending, gmailStatus, bouncedCount) {
   if (!el) return;
   bouncedCount = bouncedCount || 0;
   const fq = await api("/api/email/follow-up-queue");
+  const fr = await api("/api/email/followups/review");
+  const signedFollowups = Array.isArray(fr.items) ? fr.items : [];
   _lastFollowUpCount = fq.count || 0;
   const aq = await api("/api/email/approved-count");
   const approvedLeads = (aq && Array.isArray(aq.leads)) ? aq.leads : [];
@@ -889,7 +891,7 @@ async function renderSendingSection(sending, gmailStatus, bouncedCount) {
   const sentToday = sending.sent_today || 0;
   const cap = sending.daily_cap || 0;
   const gmailOk = gmailStatus === "OK";
-  const followupsReady = sending.followups_ready || 0;
+  const followupsReady = (sending.followups_ready || 0) + signedFollowups.filter(r => r.review_status === "Approved").length;
 
   el.innerHTML = `
     <div class="lbl" style="margin-bottom:12px;">Sending &amp; Safety</div>
@@ -909,7 +911,7 @@ async function renderSendingSection(sending, gmailStatus, bouncedCount) {
         ${sendingApproved ? "Sending..." : `Send Approved Emails (${pending})`}
       </button>
     </div>
-    ${(_lastFollowUpCount || followupsReady) ? `
+    ${(_lastFollowUpCount || followupsReady || signedFollowups.length) ? `
       <div class="card" style="padding:12px 18px;margin-top:10px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
         <span style="font-size:12px;font-weight:600;color:#0E7490;">Follow-ups</span>
         <span class="usage-note" style="margin:0;">${_lastFollowUpCount} due &middot; ${followupsReady} drafted &amp; ready</span>
@@ -919,6 +921,21 @@ async function renderSendingSection(sending, gmailStatus, bouncedCount) {
         <button class="btn gold sm" ${(!gmailOk || !followupsReady || paused) ? "disabled" : ""} onclick="sendFollowups()">Send follow-ups (${followupsReady})</button>
       </div>` : ""}
     ${paused ? `<div class="usage-note" style="color:#DC2626;">Sending is paused. No emails will go out until you resume.</div>` : ""}
+    ${signedFollowups.length ? `
+      <div class="card" style="padding:14px;margin-top:10px;">
+        <strong>Follow-up review</strong>
+        ${signedFollowups.map(r => `
+          <details style="margin-top:10px;border-top:1px solid #ddd;padding-top:10px;">
+            <summary>${esc(r.name)} · ${esc(r.message_version)} · ${esc(r.review_status)}</summary>
+            <p>To: ${esc(r.recipient)}</p>
+            <p>Subject: ${esc(r.subject)}</p>
+            <pre style="white-space:pre-wrap;">${esc(r.body)}</pre>
+            ${r.review_status === "PENDING_REVIEW" ? `<button class="btn navy sm"
+              data-lead="${esc(r.id)}" data-followup="${esc(r.followup_id)}"
+              onclick="approveSignedFollowup(this.dataset.lead,this.dataset.followup)">Approve follow-up</button>` : ""}
+          </details>`).join("")}
+        <p class="usage-note">Approval queues this exact message. Sending requires the separate Send follow-ups action.</p>
+      </div>` : ""}
     ${!gmailOk ? `<div class="usage-note">Gmail not connected. Run <code>python authorize_gmail.py</code> once, then reload.</div>` : ""}
     ${approvedLeads.length ? `
       <div class="card" style="padding:14px;margin-top:12px;">
@@ -1009,9 +1026,45 @@ async function importFollowups() {
   loadStats();
 }
 
+function requestFollowupOperatorKey() {
+  return new Promise(resolve => {
+    const dialog = document.createElement("dialog");
+    dialog.innerHTML = '<form method="dialog"><p>Authorize AIEOS follow-up with your Operator Key</p><input type="password" autocomplete="off" aria-label="AIEOS Operator Key" required><p><button value="cancel" formnovalidate>Cancel</button> <button value="authorize">Authorize</button></p></form>';
+    document.body.appendChild(dialog);
+    const input = dialog.querySelector("input");
+    dialog.addEventListener("close", () => {
+      const key = dialog.returnValue === "authorize" ? input.value : null;
+      input.value = "";
+      dialog.remove();
+      resolve(key);
+    }, {once: true});
+    dialog.showModal();
+    input.focus();
+  });
+}
+
+async function approveSignedFollowup(id, followupId) {
+  if (!window.confirm("Approve this exact follow-up? This does not send it.")) return;
+  const key = await requestFollowupOperatorKey();
+  if (!key) return;
+  const res = await api("/api/email/followups/approve", "POST", {id, followup_id: followupId},
+    {"X-AIEOS-Operator-Key": key});
+  if (res.error) { toast(res.error); return; }
+  toast("Follow-up approved; not sent");
+  loadStats();
+}
+
 async function sendFollowups() {
   if (!window.confirm("Send all drafted follow-ups as threaded Gmail replies now? They go out throttled, one at a time.")) return;
-  const res = await api("/api/email/send-followups", "POST", {});
+  const review = await api("/api/email/followups/review");
+  if (review.error) { toast(review.error); return; }
+  const headers = {};
+  if (review.items.length) {
+    const key = await requestFollowupOperatorKey();
+    if (!key) return;
+    headers["X-AIEOS-Operator-Key"] = key;
+  }
+  const res = await api("/api/email/send-followups", "POST", {}, headers);
   if (res.error) { toast(res.error); return; }
   toast(`Follow-ups: sent ${res.sent}, skipped ${res.skipped}${res.cap_reached ? " (daily cap reached)" : ""}`);
   loadLeads();
@@ -2653,8 +2706,8 @@ async function doAddLead() {
 // Helpers
 // ---------------------------------------------------------------------------
 
-async function api(url, method = "GET", body = null) {
-  const opts = { method, headers: { "Content-Type": "application/json" } };
+async function api(url, method = "GET", body = null, headers = {}) {
+  const opts = { method, headers: { "Content-Type": "application/json", ...headers } };
   if (body) opts.body = JSON.stringify(body);
   try {
     const r = await fetch(url, opts);
