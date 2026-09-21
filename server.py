@@ -5,6 +5,8 @@ Run:  python server.py   ->   http://localhost:5001
 """
 
 import csv
+import copy
+import aieos_followups
 import glob
 import hashlib
 import hmac
@@ -1611,6 +1613,8 @@ def _aieos_payload(lead: dict) -> dict:
 
 def validate_aieos_frozen_handoff(lead: dict, payload: dict | None = None, operation: str = "initial_send") -> str | None:
     """The only AIEOS provenance and frozen-field guard for all send/state paths."""
+    if operation == "followup" and payload is not None:
+        return aieos_followups.validate(lead, payload, require_approval=True)
     if not _is_aieos_frozen_handoff(lead):
         return None
     manifest = lead.get("aieos_handoff_manifest")
@@ -2094,6 +2098,8 @@ def api_email_follow_up_queue():
 FOLLOWUP_EXPORT_JSON = os.path.join(DATA_DIR, "to_followup.json")
 FOLLOWUP_WRITTEN_JSON = os.path.join(DATA_DIR, "followup_written.json")
 
+FOLLOWUP_DELIVERY_DB = os.path.join(DATA_DIR, "aieos_followup_delivery.sqlite3")
+
 FOLLOWUP_MAX_WORDS = 60
 _FOLLOWUP_BUMP_PHRASES = [
     "just following up", "following up on my", "bumping this", "bump this",
@@ -2206,11 +2212,19 @@ def api_email_import_followups():
         return jsonify({"error": "followup_written.json must be an array"}), 400
 
     prospects = [_ensure_fields(p) for p in _load()]
+    prospects = copy.deepcopy(prospects)
     imported, warnings, missing = 0, [], []
     for entry in entries:
         lead = _find(prospects, str(entry.get("id", "")))
         if not lead:
             missing.append(entry.get("id", ""))
+            continue
+        if any(key in entry for key in ("manifest", "signature", "mode", "source_lead_id", "followup_id")):
+            try:
+                imported += int(aieos_followups.import_record(
+                    prospects, lead, entry, FOLLOWUP_DELIVERY_DB))
+            except (ValueError, KeyError, TypeError) as error:
+                return jsonify({"error": str(error)}), 409
             continue
         body = (entry.get("body") or "").strip()
         issues = _followup_block_reasons(body)
@@ -2229,9 +2243,102 @@ def api_email_import_followups():
     return jsonify({"imported": imported, "missing_ids": missing, "warnings": warnings})
 
 
+@app.route("/api/email/followups/review", methods=["GET"])
+def api_followup_review():
+    return jsonify({"items": [
+        {"id": lead["id"], "name": lead.get("name"), **record}
+        for lead in _load() for record in lead.get("aieos_followups", [])
+        if record.get("review_status") in {"PENDING_REVIEW", "Approved"}
+    ]})
+
+
+@app.route("/api/email/followups/approve", methods=["POST"])
+def api_followup_approve():
+    operator_key = request.headers.get("X-AIEOS-Operator-Key")
+    error = aieos_followups.operator_error(operator_key)
+    if error:
+        return jsonify({"error": error}), 403
+    data = request.get_json(force=True)
+    prospects = _load()
+    lead = _find(prospects, data.get("id", ""))
+    if lead is None:
+        return jsonify({"error": "Lead not found"}), 404
+    try:
+        record = aieos_followups.approve(lead, data.get("followup_id"), FOLLOWUP_DELIVERY_DB, operator_key)
+    except (ValueError, KeyError, TypeError) as error:
+        return jsonify({"error": str(error)}), 409
+    _save(prospects)
+    return jsonify({"approved": True, "followup": record})
+
+
+def _run_signed_followups(gmail_client, prospects, operator_key=None):
+    """A signed branch of the existing follow-up sender, with durable reservation."""
+    results = []
+    sent = 0
+    for lead in prospects:
+        for stored in lead.get("aieos_followups", []):
+            record = copy.deepcopy(stored)
+            error = (aieos_followups.operator_error(operator_key) or
+                     validate_aieos_frozen_handoff(lead, record, operation="followup"))
+            if not error and aieos_followups.delivery_exists(FOLLOWUP_DELIVERY_DB, record):
+                error = "FOLLOWUP_VERSION_ALREADY_RESERVED_OR_USED"
+            if not error and (_kill_switch_on() or _send_count_today() >= DAILY_SEND_CAP):
+                error = "FOLLOWUP_SENDING_PAUSED_OR_CAPPED"
+            if not error and _is_dnc(record["recipient"]):
+                error = "FOLLOWUP_DO_NOT_CONTACT"
+            if not error and record["followup_type"] != "CORRECTION":
+                issues = _followup_block_reasons(record["body"])
+                if issues:
+                    error = "; ".join(issues)
+            if not error and stored != record:
+                error = "FOLLOWUP_CHANGED_DURING_GATE"
+            # Revalidate the exact immutable payload immediately before reservation.
+            if not error:
+                error = (aieos_followups.operator_error(operator_key) or
+                     validate_aieos_frozen_handoff(lead, record, operation="followup"))
+            if error:
+                results.append({"id": lead["id"], "followup_id": record.get("followup_id"),
+                                "result": "skipped", "reason": error})
+                continue
+            if not aieos_followups.reserve(FOLLOWUP_DELIVERY_DB, record):
+                results.append({"id": lead["id"], "result": "skipped",
+                                "reason": "FOLLOWUP_VERSION_ALREADY_RESERVED_OR_USED"})
+                continue
+            stored["review_status"] = "RESERVED"
+            _save(prospects)
+            if sent and SEND_DELAY_SECONDS > 0:
+                time.sleep(SEND_DELAY_SECONDS)
+            try:
+                result = gmail_client.send_email(
+                    to=record["recipient"], subject=record["subject"], body_text=record["body"],
+                    thread_id=record["original_gmail_thread_id"])
+                if not result.get("message_id") or result.get("thread_id") != record["original_gmail_thread_id"]:
+                    raise ValueError("FOLLOWUP_GMAIL_RECEIPT_MISMATCH")
+                aieos_followups.mark_delivered(FOLLOWUP_DELIVERY_DB, record, result)
+            except Exception:
+                # A failed/uncertain Gmail call may have delivered. Never automatically retry.
+                stored["review_status"] = "RECONCILIATION_REQUIRED"
+                _save(prospects)
+                results.append({"id": lead["id"], "result": "error",
+                                "reason": "FOLLOWUP_RECONCILIATION_REQUIRED"})
+                continue
+            stored.update(review_status="Used", status="Used", used=True,
+                          gmail_message_id=result["message_id"], gmail_thread_id=result["thread_id"],
+                          delivery_receipt=aieos_followups.receipt(record, result))
+            _save(prospects)
+            _bump_send_count()
+            sent += 1
+            results.append({"id": lead["id"], "followup_id": record["followup_id"], "result": "sent"})
+    return sent, results
+
+
 @app.route("/api/email/send-followups", methods=["POST"])
 def api_email_send_followups():
     """Send drafted follow-ups as threaded Gmail replies, throttled + capped."""
+    operator_key = request.headers.get("X-AIEOS-Operator-Key")
+    error = aieos_followups.batch_operator_error(_load(), operator_key)
+    if error:
+        return jsonify({"error": error}), 403
     from mailer import gmail_client
 
     if not gmail_client.is_configured():
@@ -2243,19 +2350,24 @@ def api_email_send_followups():
 
     _set_send_in_progress(True)
     try:
-        return _run_send_followups(gmail_client)
+        return _run_send_followups(gmail_client, operator_key)
     finally:
         _set_send_in_progress(False)
 
 
-def _run_send_followups(gmail_client):
-    prospects = [_ensure_fields(p) for p in _load()]
+def _run_send_followups(gmail_client, operator_key=None):
+    prospects = _load()
+    error = aieos_followups.batch_operator_error(prospects, operator_key)
+    if error:
+        return jsonify({"error": error}), 403
+    prospects = [_ensure_fields(p) for p in prospects]
+    signed_sent, signed_results = _run_signed_followups(gmail_client, prospects, operator_key)
     queue = [p for p in prospects
              if p.get("status") == "sent"
              and (p.get("follow_up_body") or "").strip()
              and p.get("gmail_thread_id")]
 
-    sent, skipped, results = 0, 0, []
+    sent, skipped, results = signed_sent, sum(r["result"] != "sent" for r in signed_results), signed_results
     cap_reached = False
     for lead in queue:
         if _kill_switch_on():
@@ -2265,7 +2377,8 @@ def _run_send_followups(gmail_client):
             cap_reached = True
             results.append({"id": lead["id"], "name": lead.get("name"), "result": "held", "reason": "daily cap reached"})
             break
-        guard_error = validate_aieos_frozen_handoff(lead, operation="followup")
+        guard_error = ("AIEOS_FOLLOWUP_NOT_AUTHORIZED" if lead.get("aieos_followups") else
+                       validate_aieos_frozen_handoff(lead, operation="followup"))
         if guard_error:
             lead["send_blocked_reason"] = guard_error
             skipped += 1
