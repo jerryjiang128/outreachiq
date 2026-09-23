@@ -10,6 +10,7 @@ import aieos_followups
 import glob
 import hashlib
 import hmac
+import ipaddress
 import io
 import json
 import os
@@ -31,6 +32,7 @@ if sys.platform == "win32":
 
 from datetime import datetime, date, timezone
 from flask import Flask, jsonify, request, render_template, Response
+from werkzeug.exceptions import BadRequest
 
 from config import (
     DATA_DIR, PROSPECTS_JSON, EXPORTS_DIR, EMAILS_DIR, ENRICHMENT_DIR,
@@ -927,6 +929,9 @@ def _ensure_fields(p: dict) -> dict:
         # Gmail sending + approval (Part 2/4)
         "approved_variant": p.get("approved_variant"),
         "approved_at": p.get("approved_at"),
+        "approved_by": p.get("approved_by"),
+        # None preserves legacy records that predate explicit send eligibility.
+        "approved_for_send": p.get("approved_for_send"),
         "gmail_message_id": p.get("gmail_message_id", ""),
         "gmail_thread_id": p.get("gmail_thread_id", ""),
         "send_blocked_reason": p.get("send_blocked_reason", ""),
@@ -1089,7 +1094,7 @@ def api_stats():
         "daily_cap": DAILY_SEND_CAP,
         "approved_pending": sum(
             1 for p in ensured
-            if _approved_index(p) is not None and p.get("status") != "sent"
+            if _approved_for_send(p) and p.get("status") != "sent"
         ),
         "followups_ready": sum(
             1 for p in ensured
@@ -1556,6 +1561,15 @@ def _approved_index(lead: dict):
         return None
 
 
+def _approved_for_send(lead: dict) -> bool:
+    """Return whether approval is eligible for the legacy send queue.
+
+    Missing/None is intentionally treated as eligible for historical records.
+    """
+    eligibility = lead.get("approved_for_send")
+    return _approved_index(lead) is not None and (eligibility is None or eligibility is True)
+
+
 def _variant_send_payload(lead: dict, variant_index: int | None) -> dict:
     """Return the exact body that will be passed to Gmail for a chosen variant."""
     variants = lead.get("email_variants") or []
@@ -1743,12 +1757,232 @@ def _update_email_log_status(lead: dict, status: str, note: str = "") -> None:
 # Approve + batch send (Part 2b)
 # ---------------------------------------------------------------------------
 
+BRIDGE_KEY_HEADER = "X-OutreachIQ-Bridge-Key"
+APPROVED_BY_HEADER = "X-OutreachIQ-Approved-By"
+BRIDGE_NETWORK_ENV = "OUTREACHIQ_WEB_BRIDGE_ALLOWED_NETWORKS"
+
+
+class StaleInitialReviewError(ValueError):
+    """Raised when a human approves content different from the reviewed detail."""
+
+
+def _bridge_auth_error() -> str | None:
+    """Authenticate a private server-to-server bridge without exposing its key."""
+    expected = os.getenv("OUTREACHIQ_WEB_BRIDGE_KEY")
+    supplied = request.headers.get(BRIDGE_KEY_HEADER)
+    if not expected:
+        return "BRIDGE_AUTH_NOT_CONFIGURED"
+    if not supplied:
+        return "BRIDGE_AUTH_REQUIRED"
+    if not hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8")):
+        return "BRIDGE_AUTH_FAILED"
+    return None
+
+
+def _bridge_network_error() -> str | None:
+    """Require the bridge request source address to match explicit CIDRs."""
+    raw = os.getenv(BRIDGE_NETWORK_ENV)
+    if not raw or not raw.strip():
+        return "BRIDGE_NETWORK_NOT_CONFIGURED"
+    try:
+        networks = [ipaddress.ip_network(value, strict=False)
+                    for value in raw.replace(",", " ").split()]
+    except ValueError:
+        return "BRIDGE_NETWORK_CONFIG_INVALID"
+    if not networks:
+        return "BRIDGE_NETWORK_CONFIG_INVALID"
+    remote = request.remote_addr
+    if not remote:
+        return "BRIDGE_REMOTE_ADDR_REQUIRED"
+    try:
+        remote_ip = ipaddress.ip_address(remote)
+    except ValueError:
+        return "BRIDGE_REMOTE_ADDR_INVALID"
+    if not any(remote_ip in network for network in networks):
+        return "BRIDGE_NETWORK_REJECTED"
+    return None
+
+
+def _bridge_guard_error() -> str | None:
+    return _bridge_network_error() or _bridge_auth_error()
+
+
+def _initial_review_variants(lead: dict) -> list[dict]:
+    """Normalize the current authoritative draft(s), including legacy single drafts."""
+    variants = lead.get("email_variants") or []
+    if variants:
+        return [
+            {
+                "variant_index": index,
+                "label": variant.get("label") or chr(65 + index),
+                "approach": variant.get("approach") or variant.get("type") or "",
+                "subject": variant.get("subject") or "",
+                "body": variant.get("body") or "",
+            }
+            for index, variant in enumerate(variants)
+        ]
+    return [{
+        "variant_index": 0,
+        "label": "single",
+        "approach": "legacy",
+        "subject": lead.get("outreach_subject") or "",
+        "body": lead.get("outreach_draft") or "",
+    }]
+
+
+def _initial_review_fingerprint(lead: dict, variant_index: int) -> str:
+    """Hash the authoritative review identity and content for one variant."""
+    variants = _initial_review_variants(lead)
+    variant = next((item for item in variants if item["variant_index"] == variant_index), None)
+    if variant is None:
+        raise ValueError("variant_index is out of range")
+    canonical = {
+        "outreachiq_lead_id": lead.get("id", ""),
+        "variant_index": variant["variant_index"],
+        "recipient": lead.get("contact_email") or "",
+        "label": variant["label"],
+        "approach": variant["approach"],
+        "subject": variant["subject"],
+        "body": variant["body"],
+    }
+    encoded = json.dumps(canonical, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _initial_review_detail(lead: dict) -> dict:
+    """Return the authoritative Initial Review representation for Web callers."""
+    normalized = _initial_review_variants(lead)
+    for variant in normalized:
+        variant["review_fingerprint"] = _initial_review_fingerprint(
+            lead, variant["variant_index"]
+        )
+    return {
+        "outreachiq_lead_id": lead.get("id", ""),
+        "recipient": lead.get("contact_email") or "",
+        "approval_state": "APPROVED" if lead.get("approved_variant") is not None else "PENDING_REVIEW",
+        "approved_variant": lead.get("approved_variant"),
+        "approved_at": lead.get("approved_at"),
+        "approved_by": lead.get("approved_by"),
+        "message_version": None,
+        "variants": normalized,
+    }
+
+
+def approve_initial(
+    lead: dict,
+    variant_index: int | None,
+    approved_by: str,
+    *,
+    record_send_prepared: bool,
+    review_fingerprint: str | None = None,
+    require_review_fingerprint: bool = False,
+) -> dict:
+    """Approve one authoritative Initial variant, optionally preserving legacy queue metadata."""
+    if not isinstance(approved_by, str) or not approved_by.strip():
+        raise ValueError("approved_by is required")
+    variants = lead.get("email_variants") or []
+    if variant_index is None:
+        variant_index = 0
+    if isinstance(variant_index, bool) or not isinstance(variant_index, int):
+        raise ValueError("variant_index must be a number")
+    if variant_index < 0 or variant_index >= max(1, len(variants)):
+        raise ValueError("variant_index is out of range")
+    if not variants and not (lead.get("outreach_draft") or "").strip():
+        raise ValueError("Lead has no email draft to approve")
+
+    if require_review_fingerprint and not review_fingerprint:
+        raise ValueError("review_fingerprint is required")
+    if review_fingerprint is not None:
+        if (not isinstance(review_fingerprint, str) or len(review_fingerprint) != 64
+                or any(ch not in "0123456789abcdefABCDEF" for ch in review_fingerprint)):
+            raise ValueError("review_fingerprint is invalid")
+        current_fingerprint = _initial_review_fingerprint(lead, variant_index)
+        if not hmac.compare_digest(review_fingerprint, current_fingerprint):
+            raise StaleInitialReviewError("INITIAL_REVIEW_STALE")
+
+    lead["approved_variant"] = variant_index
+    lead["approved_at"] = _now()
+    lead["approved_by"] = approved_by.strip()
+    lead["approved_for_send"] = bool(record_send_prepared)
+    if record_send_prepared:
+        _record_send_prepared(lead, variant_index, "gmail")
+    return lead
+
+
+def _bridge_approved_by() -> str:
+    approved_by = (request.headers.get(APPROVED_BY_HEADER) or "").strip()
+    if not approved_by or len(approved_by) > 100:
+        raise ValueError("approved_by header is required")
+    return approved_by
+
+
+@app.route("/api/internal/initial-review/<lead_id>")
+def api_initial_review_detail(lead_id):
+    error = _bridge_guard_error()
+    if error:
+        return jsonify({"error": error}), 403
+    prospects = [_ensure_fields(p) for p in _load()]
+    lead = _find(prospects, lead_id)
+    if lead is None:
+        return jsonify({"error": "Lead not found"}), 404
+    return jsonify(_initial_review_detail(lead))
+
+
+@app.route("/api/internal/initial-review/<lead_id>/approve", methods=["POST"])
+def api_initial_review_approve(lead_id):
+    error = _bridge_guard_error()
+    if error:
+        return jsonify({"error": error}), 403
+    try:
+        data = request.get_json(force=True) if request.data else {}
+    except BadRequest:
+        return jsonify({"error": "Invalid JSON"}), 400
+    if not isinstance(data, dict) or set(data) - {"variant_index", "review_fingerprint"}:
+        return jsonify({"error": "Only variant_index and review_fingerprint may be supplied"}), 400
+    # Keep the bridge approval write narrow: do not backfill legacy send-prep
+    # metadata merely because a Web approval was recorded.
+    prospects = _load()
+    lead = _find(prospects, lead_id)
+    if lead is None:
+        return jsonify({"error": "Lead not found"}), 404
+    variants = lead.get("email_variants") or []
+    if "review_fingerprint" not in data:
+        return jsonify({"error": "review_fingerprint is required"}), 400
+    if data.get("variant_index") is None and len(variants) > 1:
+        return jsonify({"error": "variant_index is required for multiple variants"}), 400
+    variant_index = data.get("variant_index")
+    if variant_index is not None and (isinstance(variant_index, bool) or not isinstance(variant_index, int)):
+        return jsonify({"error": "variant_index must be a number"}), 400
+    try:
+        approved_by = _bridge_approved_by()
+        approve_initial(
+            lead, variant_index, approved_by, record_send_prepared=False,
+            review_fingerprint=data["review_fingerprint"],
+            require_review_fingerprint=True,
+        )
+    except StaleInitialReviewError as error:
+        return jsonify({"error": str(error)}), 409
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 400
+    _save(prospects)
+    return jsonify(_initial_review_detail(lead))
+
+
 @app.route("/api/email/approve", methods=["POST"])
 def api_email_approve():
     """Mark a lead's chosen variant approved and queued. Sends nothing."""
     prospects = _load()
-    data = request.get_json(force=True) if request.data else {}
-    lead_id = (data.get("id") or data.get("lead_id") or "").strip()
+    try:
+        data = request.get_json(force=True) if request.data else {}
+    except BadRequest:
+        return jsonify({"error": "Invalid JSON"}), 400
+    if not isinstance(data, dict):
+        return jsonify({"error": "JSON object required"}), 400
+    lead_id = data.get("id") or data.get("lead_id") or ""
+    if not isinstance(lead_id, str):
+        return jsonify({"error": "id must be a string"}), 400
+    lead_id = lead_id.strip()
     if not lead_id:
         return jsonify({"error": "id is required"}), 400
 
@@ -1761,6 +1995,8 @@ def api_email_approve():
     if unapprove:
         lead["approved_variant"] = None
         lead["approved_at"] = None
+        lead["approved_by"] = None
+        lead["approved_for_send"] = None
         _save(prospects)
         return jsonify({"lead": lead, "approved": False})
 
@@ -1770,15 +2006,16 @@ def api_email_approve():
     except (TypeError, ValueError):
         return jsonify({"error": "variant_index must be a number"}), 400
 
-    variants = lead.get("email_variants") or []
-    if variants and (variant_index < 0 or variant_index >= len(variants)):
-        return jsonify({"error": "variant_index is out of range"}), 400
-    if not variants and not (lead.get("outreach_draft") or "").strip():
-        return jsonify({"error": "Lead has no email draft to approve"}), 400
-
-    lead["approved_variant"] = variant_index
-    lead["approved_at"] = _now()
-    _record_send_prepared(lead, variant_index, "gmail")
+    try:
+        approve_initial(
+            lead, variant_index, "legacy-api", record_send_prepared=True,
+            review_fingerprint=_initial_review_fingerprint(lead, variant_index),
+            require_review_fingerprint=True,
+        )
+    except StaleInitialReviewError as error:
+        return jsonify({"error": str(error)}), 409
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 400
     _save(prospects)
     return jsonify({"lead": lead, "approved": True})
 
@@ -1787,7 +2024,7 @@ def api_email_approve():
 def api_email_approved_count():
     prospects = [_ensure_fields(p) for p in _load()]
     pending = [p for p in prospects
-               if _approved_index(p) is not None and p.get("status") != "sent"]
+               if _approved_for_send(p) and p.get("status") != "sent"]
     leads = []
     for p in pending:
         idx = _approved_index(p)
@@ -1848,7 +2085,7 @@ def _run_send_approved(gmail_client, limit):
     contacted = _already_contacted_emails(prospects)
 
     queue = [p for p in prospects
-             if _approved_index(p) is not None and p.get("status") != "sent"]
+             if _approved_for_send(p) and p.get("status") != "sent"]
     if limit:
         queue = queue[:limit]
 
@@ -1915,6 +2152,8 @@ def _run_send_approved(gmail_client, limit):
         lead["send_blocked_reason"] = ""
         lead["approved_variant"] = None
         lead["approved_at"] = None
+        lead["approved_by"] = None
+        lead["approved_for_send"] = None
         _record_sent(lead, variant_index=idx, channel="gmail")
         lead["status"] = "sent"
         _archive_sent_email(lead, payload)
