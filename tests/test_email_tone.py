@@ -1,7 +1,9 @@
 import json
 import os
 import hashlib
+import sqlite3
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -106,6 +108,222 @@ class EmailToneAuditTests(unittest.TestCase):
         self.assertIsNone(server.validate_aieos_frozen_handoff(lead, payload))
         lead["notes"] = "operator changed this note"
         self.assertIsNone(server.validate_aieos_frozen_handoff(lead, payload))
+
+    def test_single_initial_snapshot_is_exact_and_duplicate_is_reserved(self):
+        import server
+        class FakeGmail:
+            calls = []
+            def send_email(self, **kwargs):
+                self.calls.append(kwargs)
+                return {"message_id": "gm-1", "thread_id": "thread-1"}
+        lead = _aieos_lead(server)
+        lead.update(approved_at="now", approved_by="operator")
+        gmail = FakeGmail()
+        with tempfile.TemporaryDirectory() as root, \
+             patch.object(server, "INITIAL_DELIVERY_DB", os.path.join(root, "delivery.sqlite3")), \
+             patch.object(server, "_load_dnc", return_value={}), patch.object(server, "_save"), \
+             patch.object(server, "_persist_aieos_initial_receipt"), patch.object(server, "_kill_switch_on", return_value=False):
+            result = server._send_one_aieos_initial(lead, [lead], gmail)
+            again = server._send_one_aieos_initial(lead, [lead], gmail)
+        self.assertTrue(result["sent"])
+        self.assertEqual(gmail.calls, [{"to": "alex@example.com", "subject": "Subject", "body_text": "Dear Alex,\n\nA concise note."}])
+        self.assertFalse(again["sent"])
+
+    def test_gate_mutation_blocks_before_gmail(self):
+        import server
+        lead = _aieos_lead(server); lead.update(approved_at="now", approved_by="operator")
+        class FakeGmail:
+            calls = 0
+            def send_email(self, **kwargs): self.calls += 1
+        gmail = FakeGmail()
+        def mutate(*_args):
+            lead["outreach_draft"] = "tampered"
+            return None
+        with tempfile.TemporaryDirectory() as root, patch.object(server, "INITIAL_DELIVERY_DB", os.path.join(root, "delivery.sqlite3")), patch.object(server, "_pre_send_gate", side_effect=mutate):
+            result = server._send_one_aieos_initial(lead, [lead], gmail)
+        self.assertEqual(result["reason"], "INITIAL_CHANGED_DURING_GATE")
+        self.assertEqual(gmail.calls, 0)
+
+    def test_legacy_batch_rejects_aieos_frozen_initial_before_gmail(self):
+        import server
+        lead = _aieos_lead(server)
+        lead.update(approved_for_send=True, approved_at="now", approved_by="operator")
+        class FakeGmail:
+            calls = 0
+            def send_email(self, **kwargs): self.calls += 1
+        gmail = FakeGmail()
+        with patch.object(server, "_load", return_value=[lead]), patch.object(server, "_save"), \
+             patch.object(server, "_load_dnc", return_value={}), patch.object(server, "_kill_switch_on", return_value=False), \
+             server.app.test_request_context():
+            result = server._run_send_approved(gmail, 1).get_json()
+        self.assertEqual(gmail.calls, 0)
+        self.assertEqual(lead["status"], "drafted")
+        self.assertEqual(result["results"][0]["reason"], "AIEOS_INITIAL_REQUIRES_SINGLE_SEND")
+
+    def test_unknown_gmail_result_reserves_and_never_retries(self):
+        import server
+        lead = _aieos_lead(server); lead.update(approved_at="now", approved_by="operator")
+        class FakeGmail:
+            calls = 0
+            def send_email(self, **kwargs):
+                self.calls += 1
+                raise TimeoutError("unknown")
+        gmail = FakeGmail()
+        with tempfile.TemporaryDirectory() as root, patch.object(server, "INITIAL_DELIVERY_DB", os.path.join(root, "delivery.sqlite3")), \
+             patch.object(server, "_load_dnc", return_value={}), patch.object(server, "_save"), patch.object(server, "_kill_switch_on", return_value=False):
+            self.assertEqual(server._send_one_aieos_initial(lead, [lead], gmail)["reason"], "INITIAL_RECONCILIATION_REQUIRED")
+            self.assertEqual(server._send_one_aieos_initial(lead, [lead], gmail)["reason"], "INITIAL_DELIVERY_ALREADY_RESERVED")
+        self.assertEqual(gmail.calls, 1)
+
+    def test_true_concurrency_allows_one_initial_gmail_call(self):
+        import server
+        lead = _aieos_lead(server); lead.update(approved_at="now", approved_by="operator")
+        class FakeGmail:
+            calls = 0
+            lock = threading.Lock()
+            def send_email(self, **kwargs):
+                with self.lock: self.calls += 1
+                return {"message_id": "gm", "thread_id": "thread"}
+        gmail, results, errors = FakeGmail(), [], []
+        with tempfile.TemporaryDirectory() as root, patch.object(server, "INITIAL_DELIVERY_DB", os.path.join(root, "delivery.sqlite3")), \
+             patch.object(server, "_load_dnc", return_value={}), patch.object(server, "_save"), patch.object(server, "_persist_aieos_initial_receipt"), patch.object(server, "_kill_switch_on", return_value=False):
+            real_reserve = server.initial_deliveries.reserve
+            barrier = threading.Barrier(2)
+
+            def synchronized_reserve(path, snapshot):
+                barrier.wait(timeout=5)
+                return real_reserve(path, snapshot)
+
+            def send_once():
+                try:
+                    results.append(server._send_one_aieos_initial(lead, [lead], gmail))
+                except BaseException as error:  # Test must surface every worker failure.
+                    errors.append(error)
+
+            with patch.object(server.initial_deliveries, "reserve", side_effect=synchronized_reserve):
+                threads = [threading.Thread(target=send_once) for _ in range(2)]
+                for thread in threads: thread.start()
+                for thread in threads: thread.join(timeout=10)
+            snapshot = server._initial_snapshot(lead, server._variant_send_payload(lead, 0))
+            stored = server.initial_deliveries.get(server.INITIAL_DELIVERY_DB, snapshot)
+            connection = sqlite3.connect(server.INITIAL_DELIVERY_DB)
+            try:
+                ledger_rows = connection.execute("SELECT COUNT(*) FROM initial_delivery WHERE source_lead_id=?", (snapshot["source_lead_id"],)).fetchone()[0]
+            finally:
+                connection.close()
+        self.assertFalse(errors)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(gmail.calls, 1)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(sum(result.get("sent") is True for result in results), 1)
+        self.assertEqual(sum(result.get("reason") == "INITIAL_DELIVERY_ALREADY_RESERVED" for result in results), 1)
+        self.assertEqual(ledger_rows, 1)
+        self.assertEqual(stored["status"], "COMPLETED")
+
+    def test_post_gmail_ledger_failure_is_reconciliation_and_never_retries(self):
+        import server
+
+        class FakeGmail:
+            calls = 0
+            def send_email(self, **_kwargs):
+                self.calls += 1
+                return {"message_id": "gm-ledger", "thread_id": "thread-ledger"}
+
+        lead = _aieos_lead(server); lead.update(approved_at="now", approved_by="operator")
+        gmail = FakeGmail()
+        with tempfile.TemporaryDirectory() as root, patch.object(server, "INITIAL_DELIVERY_DB", os.path.join(root, "delivery.sqlite3")), \
+             patch.object(server, "_load_dnc", return_value={}), patch.object(server, "_save"), \
+             patch.object(server, "_persist_aieos_initial_receipt"), patch.object(server, "_kill_switch_on", return_value=False):
+            real_update = server.initial_deliveries.update
+            failed = False
+
+            def fail_first_post_gmail_update(path, snapshot, status, result=None, error=None):
+                nonlocal failed
+                if status == "GMAIL_DELIVERED_PENDING_PERSISTENCE" and not failed:
+                    failed = True
+                    raise OSError("ledger unavailable")
+                return real_update(path, snapshot, status, result, error)
+
+            with patch.object(server.initial_deliveries, "update", side_effect=fail_first_post_gmail_update):
+                first = server._send_one_aieos_initial(lead, [lead], gmail)
+                second = server._send_one_aieos_initial(lead, [lead], gmail)
+            snapshot = server._initial_snapshot(lead, server._variant_send_payload(lead, 0))
+            stored = server.initial_deliveries.get(server.INITIAL_DELIVERY_DB, snapshot)
+        self.assertEqual(first["reason"], "INITIAL_RECONCILIATION_REQUIRED")
+        self.assertEqual(second["reason"], "INITIAL_DELIVERY_ALREADY_RESERVED")
+        self.assertEqual(gmail.calls, 1)
+        self.assertEqual(stored["status"], "RECONCILIATION_REQUIRED")
+        self.assertEqual(lead["status"], "drafted")
+
+    def test_post_gmail_save_failure_is_reconciliation_and_never_retries(self):
+        import server
+
+        class FakeGmail:
+            calls = 0
+            def send_email(self, **_kwargs):
+                self.calls += 1
+                return {"message_id": "gm-save", "thread_id": "thread-save"}
+
+        lead = _aieos_lead(server); lead.update(approved_at="now", approved_by="operator")
+        gmail = FakeGmail()
+        with tempfile.TemporaryDirectory() as root, patch.object(server, "INITIAL_DELIVERY_DB", os.path.join(root, "delivery.sqlite3")), \
+             patch.object(server, "_load_dnc", return_value={}), patch.object(server, "_save", side_effect=OSError("save unavailable")), \
+             patch.object(server, "_persist_aieos_initial_receipt") as receipt, patch.object(server, "_kill_switch_on", return_value=False):
+            first = server._send_one_aieos_initial(lead, [lead], gmail)
+            second = server._send_one_aieos_initial(lead, [lead], gmail)
+            snapshot = server._initial_snapshot(lead, server._variant_send_payload(lead, 0))
+            stored = server.initial_deliveries.get(server.INITIAL_DELIVERY_DB, snapshot)
+        self.assertEqual(first["reason"], "INITIAL_RECONCILIATION_REQUIRED")
+        self.assertEqual(second["reason"], "INITIAL_DELIVERY_ALREADY_RESERVED")
+        self.assertEqual(gmail.calls, 1)
+        self.assertEqual(stored["status"], "RECONCILIATION_REQUIRED")
+        receipt.assert_not_called()
+
+    def test_post_gmail_receipt_failure_is_reconciliation_and_never_retries(self):
+        import server
+
+        class FakeGmail:
+            calls = 0
+            def send_email(self, **_kwargs):
+                self.calls += 1
+                return {"message_id": "gm-receipt", "thread_id": "thread-receipt"}
+
+        lead = _aieos_lead(server); lead.update(approved_at="now", approved_by="operator")
+        gmail = FakeGmail()
+        with tempfile.TemporaryDirectory() as root, patch.object(server, "INITIAL_DELIVERY_DB", os.path.join(root, "delivery.sqlite3")), \
+             patch.object(server, "_load_dnc", return_value={}), patch.object(server, "_save"), \
+             patch.object(server, "_persist_aieos_initial_receipt", side_effect=TimeoutError("receipt unavailable")), \
+             patch.object(server, "_kill_switch_on", return_value=False):
+            first = server._send_one_aieos_initial(lead, [lead], gmail)
+            second = server._send_one_aieos_initial(lead, [lead], gmail)
+            snapshot = server._initial_snapshot(lead, server._variant_send_payload(lead, 0))
+            stored = server.initial_deliveries.get(server.INITIAL_DELIVERY_DB, snapshot)
+        self.assertEqual(first["reason"], "INITIAL_RECONCILIATION_REQUIRED")
+        self.assertEqual(second["reason"], "INITIAL_DELIVERY_ALREADY_RESERVED")
+        self.assertEqual(gmail.calls, 1)
+        self.assertEqual(stored["status"], "RECONCILIATION_REQUIRED")
+
+    def test_missing_gmail_message_id_is_reconciliation_and_never_retries(self):
+        import server
+
+        class FakeGmail:
+            calls = 0
+            def send_email(self, **_kwargs):
+                self.calls += 1
+                return {"thread_id": "thread-only"}
+
+        lead = _aieos_lead(server); lead.update(approved_at="now", approved_by="operator")
+        gmail = FakeGmail()
+        with tempfile.TemporaryDirectory() as root, patch.object(server, "INITIAL_DELIVERY_DB", os.path.join(root, "delivery.sqlite3")), \
+             patch.object(server, "_load_dnc", return_value={}), patch.object(server, "_save"), patch.object(server, "_kill_switch_on", return_value=False):
+            first = server._send_one_aieos_initial(lead, [lead], gmail)
+            second = server._send_one_aieos_initial(lead, [lead], gmail)
+            snapshot = server._initial_snapshot(lead, server._variant_send_payload(lead, 0))
+            stored = server.initial_deliveries.get(server.INITIAL_DELIVERY_DB, snapshot)
+        self.assertEqual(first["reason"], "INITIAL_RECONCILIATION_REQUIRED")
+        self.assertEqual(second["reason"], "INITIAL_DELIVERY_ALREADY_RESERVED")
+        self.assertEqual(gmail.calls, 1)
+        self.assertEqual(stored["status"], "RECONCILIATION_REQUIRED")
 
     def test_aieos_metadata_missing_or_tampered_fails_closed(self):
         import server

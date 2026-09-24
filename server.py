@@ -7,6 +7,7 @@ Run:  python server.py   ->   http://localhost:5001
 import csv
 import copy
 import aieos_followups
+import initial_deliveries
 import glob
 import hashlib
 import hmac
@@ -19,6 +20,7 @@ import shutil
 import sys
 import threading
 import time
+import urllib.request
 from collections import Counter, defaultdict
 
 # Force UTF-8 console output on Windows. reconfigure() keeps the original
@@ -42,7 +44,7 @@ from config import (
     SERVICE_SEARCH_PRESETS, DEFAULT_LIMIT, MAX_LIMIT,
     GOOGLE_PLACES_API_KEY, FIRECRAWL_API_KEY, validate_keys,
     EMAIL_LOG_MD, DO_NOT_CONTACT_JSON, SEND_LOCK_JSON, SEND_COUNTER_JSON,
-    SEND_ACTIVE_JSON,
+    SEND_ACTIVE_JSON, INITIAL_DELIVERY_DB,
     EMAIL_SIGNATURE, SEND_DELAY_SECONDS, DAILY_SEND_CAP, FOLLOW_UP_DAYS,
     REPLY_POLL_MINUTES, MEMORY_MD,
 )
@@ -1668,6 +1670,77 @@ def validate_aieos_frozen_handoff(lead: dict, payload: dict | None = None, opera
     return None
 
 
+def _initial_snapshot(lead: dict, payload: dict) -> dict:
+    """Copy the only business payload permitted to reach Gmail."""
+    manifest = lead["aieos_handoff_manifest"]
+    return {
+        "source_lead_id": manifest["source_lead_id"], "send_prep_id": manifest["send_prep_id"],
+        "message_version": manifest["message_version"], "recipient": lead["contact_email"],
+        "subject": payload["subject"], "body": payload["body"], "manifest": copy.deepcopy(manifest),
+        "signature": lead["aieos_handoff_signature"], "approved_variant": _approved_index(lead),
+        "approved_at": lead.get("approved_at"), "approved_by": lead.get("approved_by"),
+    }
+
+
+def _validate_initial_snapshot(snapshot: dict) -> str | None:
+    lead = {"source_system": "AIEOS", "contact_email": snapshot["recipient"],
+            "aieos_handoff_manifest": snapshot["manifest"], "aieos_handoff_signature": snapshot["signature"]}
+    return validate_aieos_frozen_handoff(lead, {"subject": snapshot["subject"], "body": snapshot["body"]})
+
+
+def _persist_aieos_initial_receipt(snapshot: dict, result: dict) -> None:
+    """Post a signed receipt only after Gmail has produced a usable message id."""
+    base = os.getenv("AIEOS_API_BASE_URL", "").rstrip("/")
+    key = os.getenv("AIEOS_OPERATOR_API_KEY", "")
+    if not base or not key:
+        raise RuntimeError("AIEOS_INITIAL_RECEIPT_NOT_CONFIGURED")
+    manifest = {"source_system": "AIEOS", "mode": "INITIAL_RECEIPT", **snapshot["manifest"],
+                "gmail_message_id": result["message_id"], "gmail_thread_id": result.get("thread_id", "")}
+    signature = _aieos_manifest_signature(manifest)
+    if not signature:
+        raise RuntimeError("AIEOS_INITIAL_RECEIPT_SIGNATURE_UNAVAILABLE")
+    data = json.dumps({"manifest": manifest, "signature": signature}).encode("utf-8")
+    request_data = urllib.request.Request(base + "/initial-deliveries/receipt", data=data, method="POST",
+        headers={"Content-Type": "application/json", "X-AIEOS-Operator-Key": key})
+    with urllib.request.urlopen(request_data, timeout=10) as response:
+        if response.status < 200 or response.status >= 300:
+            raise RuntimeError("AIEOS_INITIAL_RECEIPT_REJECTED")
+
+
+def _send_one_aieos_initial(lead: dict, prospects: list[dict], gmail_client) -> dict:
+    if lead.get("approved_variant") is None or not lead.get("approved_at") or not lead.get("approved_by"):
+        return {"sent": False, "reason": "INITIAL_HUMAN_APPROVAL_REQUIRED"}
+    payload = _variant_send_payload(lead, _approved_index(lead))
+    snapshot = _initial_snapshot(lead, payload)
+    error = validate_aieos_frozen_handoff(lead, payload) or _pre_send_gate(lead, prospects)
+    if not error and _variant_send_payload(lead, _approved_index(lead)) != payload:
+        error = "INITIAL_CHANGED_DURING_GATE"
+    if error:
+        return {"sent": False, "reason": error}
+    if not initial_deliveries.reserve(INITIAL_DELIVERY_DB, snapshot):
+        return {"sent": False, "reason": "INITIAL_DELIVERY_ALREADY_RESERVED"}
+    # The final validation is over the immutable snapshot, exactly before Gmail.
+    error = _validate_initial_snapshot(snapshot)
+    if error:
+        initial_deliveries.update(INITIAL_DELIVERY_DB, snapshot, "RECONCILIATION_REQUIRED", error=error)
+        return {"sent": False, "reason": error}
+    try:
+        result = gmail_client.send_email(to=snapshot["recipient"], subject=snapshot["subject"], body_text=snapshot["body"])
+        if not result.get("message_id"):
+            raise ValueError("GMAIL_MESSAGE_ID_MISSING")
+        initial_deliveries.update(INITIAL_DELIVERY_DB, snapshot, "GMAIL_DELIVERED_PENDING_PERSISTENCE", result)
+        lead.update(gmail_message_id=result["message_id"], gmail_thread_id=result.get("thread_id", ""),
+                    send_blocked_reason="", status="sent")
+        _record_sent(lead, variant_index=snapshot["approved_variant"], channel="gmail")
+        _save(prospects)
+        _persist_aieos_initial_receipt(snapshot, result)
+        initial_deliveries.update(INITIAL_DELIVERY_DB, snapshot, "COMPLETED", result)
+    except Exception as exc:
+        initial_deliveries.update(INITIAL_DELIVERY_DB, snapshot, "RECONCILIATION_REQUIRED", locals().get("result"), type(exc).__name__)
+        return {"sent": False, "reason": "INITIAL_RECONCILIATION_REQUIRED"}
+    return {"sent": True, "gmail_message_id": result["message_id"], "gmail_thread_id": result.get("thread_id", "")}
+
+
 def _slugify(text: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
     return slug[:60] or "lead"
@@ -1969,6 +2042,28 @@ def api_initial_review_approve(lead_id):
     return jsonify(_initial_review_detail(lead))
 
 
+@app.route("/api/internal/initial-send/<lead_id>", methods=["POST"])
+def api_initial_send_one(lead_id):
+    error = _bridge_guard_error()
+    if error:
+        return jsonify({"error": error}), 403
+    from mailer import gmail_client
+    if not gmail_client.is_configured():
+        return jsonify({"error": "GMAIL_NOT_CONFIGURED"}), 409
+    if _kill_switch_on() or _send_in_progress():
+        return jsonify({"error": "INITIAL_SEND_UNAVAILABLE"}), 409
+    prospects = [_ensure_fields(p) for p in _load()]
+    lead = _find(prospects, lead_id)
+    if lead is None:
+        return jsonify({"error": "INITIAL_REVIEW_NOT_FOUND"}), 404
+    _set_send_in_progress(True)
+    try:
+        result = _send_one_aieos_initial(lead, prospects, gmail_client)
+    finally:
+        _set_send_in_progress(False)
+    return jsonify(result), 200 if result["sent"] else 409
+
+
 @app.route("/api/email/approve", methods=["POST"])
 def api_email_approve():
     """Mark a lead's chosen variant approved and queued. Sends nothing."""
@@ -2108,6 +2203,13 @@ def _run_send_approved(gmail_client, limit):
             lead["send_blocked_reason"] = guard_error
             skipped += 1
             results.append({"id": lead["id"], "name": lead.get("name"), "result": "skipped", "reason": guard_error})
+            continue
+        if _is_aieos_frozen_handoff(lead):
+            # AIEOS Initial mail must use the single-send snapshot/ledger path.
+            lead["send_blocked_reason"] = "AIEOS_INITIAL_REQUIRES_SINGLE_SEND"
+            skipped += 1
+            results.append({"id": lead["id"], "name": lead.get("name"), "result": "skipped",
+                            "reason": "AIEOS_INITIAL_REQUIRES_SINGLE_SEND"})
             continue
 
         # Idempotency: a lead that already carries a Gmail message id was sent

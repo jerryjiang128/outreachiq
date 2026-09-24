@@ -36,6 +36,7 @@ DO_NOT_CONTACT_JSON = os.path.join(DATA_DIR, "do_not_contact.json")
 SEND_LOCK_JSON  = os.path.join(DATA_DIR, "send_lock.json")
 SEND_COUNTER_JSON = os.path.join(DATA_DIR, "send_counter.json")
 SEND_ACTIVE_JSON = os.path.join(DATA_DIR, "send_active.json")
+INITIAL_DELIVERY_DB = os.path.join(DATA_DIR, "aieos_initial_delivery.sqlite3")
 
 # ---------------------------------------------------------------------------
 # Gmail sending (Gmail API, OAuth2) - minimal scopes: send + read replies only.
