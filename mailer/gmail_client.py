@@ -74,6 +74,17 @@ def is_configured() -> bool:
         return False
 
 
+def get_profile() -> dict:
+    """Return the authenticated Gmail identity without sending or reading mail."""
+    service = _service()
+    profile = service.users().getProfile(userId="me").execute()
+    return {
+        "email_address": profile.get("emailAddress", ""),
+        "messages_total": profile.get("messagesTotal"),
+        "threads_total": profile.get("threadsTotal"),
+    }
+
+
 def status() -> dict:
     """Lightweight status for the dashboard Stats tab."""
     have_secret = os.path.exists(GMAIL_CLIENT_SECRET_FILE)
