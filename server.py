@@ -7,6 +7,7 @@ Run:  python server.py   ->   http://localhost:5001
 import csv
 import copy
 import aieos_followups
+import aieos_internal_test
 import initial_deliveries
 import glob
 import hashlib
@@ -44,7 +45,7 @@ from config import (
     SERVICE_SEARCH_PRESETS, DEFAULT_LIMIT, MAX_LIMIT,
     GOOGLE_PLACES_API_KEY, FIRECRAWL_API_KEY, validate_keys,
     EMAIL_LOG_MD, DO_NOT_CONTACT_JSON, SEND_LOCK_JSON, SEND_COUNTER_JSON,
-    SEND_ACTIVE_JSON, INITIAL_DELIVERY_DB,
+    SEND_ACTIVE_JSON, INITIAL_DELIVERY_DB, INTERNAL_TEST_DELIVERY_DB,
     EMAIL_SIGNATURE, SEND_DELAY_SECONDS, DAILY_SEND_CAP, FOLLOW_UP_DAYS,
     REPLY_POLL_MINUTES, MEMORY_MD,
 )
@@ -1878,6 +1879,43 @@ def _bridge_network_error() -> str | None:
 
 def _bridge_guard_error() -> str | None:
     return _bridge_network_error() or _bridge_auth_error()
+
+
+
+@app.route("/api/aieos/internal-test-send", methods=["POST"])
+def api_aieos_internal_test_send():
+    """Validate and deliver only signed, allowlisted INTERNAL_TEST handoffs."""
+    error = _bridge_guard_error()
+    if error:
+        return jsonify({"error": error}), 403
+
+    if not request.data:
+        return jsonify({"error": "INTERNAL_TEST_PAYLOAD_INVALID"}), 400
+    try:
+        data = request.get_json(force=True)
+    except BadRequest:
+        return jsonify({"error": "INTERNAL_TEST_PAYLOAD_INVALID"}), 400
+    if not isinstance(data, dict):
+        return jsonify({"error": "INTERNAL_TEST_PAYLOAD_INVALID"}), 400
+    dry_run = data.get("dry_run", False)
+    if not isinstance(dry_run, bool):
+        return jsonify({"error": "INTERNAL_TEST_DRY_RUN_INVALID"}), 400
+
+    from mailer import gmail_client
+
+    try:
+        result = aieos_internal_test.deliver(
+            data, INTERNAL_TEST_DELIVERY_DB, gmail_client, dry_run=dry_run
+        )
+    except aieos_internal_test.InternalTestError as exc:
+        code = str(exc)
+        status = 503 if code in {
+            "INTERNAL_TEST_SIGNATURE_NOT_CONFIGURED",
+            "INTERNAL_TEST_RECEIPT_NOT_CONFIGURED",
+            "GMAIL_NOT_CONFIGURED",
+        } else 409
+        return jsonify({"error": code}), status
+    return jsonify(result), 200
 
 
 def _initial_review_variants(lead: dict) -> list[dict]:
