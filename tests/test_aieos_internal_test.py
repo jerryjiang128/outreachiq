@@ -1,6 +1,8 @@
 import os
 import tempfile
 import unittest
+from email import policy
+from email.parser import BytesParser
 from pathlib import Path
 from unittest.mock import patch
 
@@ -50,6 +52,9 @@ class _FakeGmail:
 
     def is_configured(self):
         return True
+
+    def is_sender_authorized(self, sender):
+        return sender == "iris@ibeautytech.com"
 
     def send_email(self, **kwargs):
         self.calls.append(kwargs)
@@ -183,3 +188,32 @@ class InternalTestRouteTests(unittest.TestCase):
                 )
             self.assertEqual(response.status_code, 200)
             self.assertEqual(prospects.read_bytes(), before)
+
+class MimeUnicodeRegressionTests(unittest.TestCase):
+    BODY = """Dear Emily,
+
+I came across Laze & Amaze’s diode laser range and noticed that you also provide UK-based training, servicing and ongoing technical support to clinics.
+
+We are a manufacturer of professional diode laser hair-removal systems in Shenzhen, and I thought there may be an opportunity to explore OEM/private-label supply or additional diode laser platforms for your range.
+
+If this is relevant to your sourcing plans, I’d be happy to send a short product overview and specifications for you to review.
+
+Best regards,
+
+Jerry
+Shenzhen IRIS Technology Co., Ltd.
+iris@ibeautytech.com
+https://www.ibeautytech.com
+"""
+
+    def test_canonical_body_serializes_as_utf8_crlf_without_unicode_mutation(self):
+        from mailer.gmail_client import build_message
+        message = build_message(to="jerryjiang128@gmail.com", subject="Diode laser OEM & supply cooperation", body_text=self.BODY, sender="iris@ibeautytech.com")
+        raw = message.as_bytes(policy=policy.SMTP)
+        self.assertNotIn(b"\n", raw.replace(b"\r\n", b""))
+        parsed = BytesParser(policy=policy.default).parsebytes(raw)
+        self.assertEqual(parsed.get_content_type(), "text/plain")
+        self.assertEqual(parsed.get_content_charset(), "utf-8")
+        self.assertEqual(parsed.get_content().replace("\r\n", "\n"), self.BODY)
+        self.assertIn("Laze & Amaze’s diode laser range", parsed.get_content())
+        self.assertIn("I’d be happy", parsed.get_content())

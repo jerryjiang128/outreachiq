@@ -65,6 +65,11 @@ def _required_text(payload: dict[str, Any], field: str) -> str:
     return value.strip()
 
 
+def _required_frozen_text(payload: dict[str, Any], field: str) -> str:
+    value = payload.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise _error("INTERNAL_TEST_PAYLOAD_INVALID")
+    return value
 def _allowed_recipients() -> set[str]:
     return {
         value.strip().casefold()
@@ -113,8 +118,8 @@ def validate_payload(payload: Any) -> dict[str, Any]:
     test_recipient = _required_text(payload, "test_recipient")
     customer_recipient = _required_text(payload, "customer_recipient")
     sender = _required_text(payload, "sender")
-    subject = _required_text(payload, "subject")
-    body = _required_text(payload, "body")
+    subject = _required_frozen_text(payload, "subject")
+    body = _required_frozen_text(payload, "body")
     test_id = _required_text(payload, "test_id")
 
     normalized_test = test_recipient.casefold()
@@ -298,9 +303,9 @@ def deliver(
 
     if receipt_sender is None and not receipt_configured():
         raise _error("INTERNAL_TEST_RECEIPT_NOT_CONFIGURED")
-    configured = getattr(gmail_client, "is_configured", None)
-    if callable(configured) and not configured():
-        raise _error("GMAIL_NOT_CONFIGURED")
+    authorized = getattr(gmail_client, "is_sender_authorized", None)
+    if not callable(authorized) or not authorized(snapshot["sender"]):
+        raise _error("INTERNAL_TEST_SENDER_NOT_AUTHORIZED")
 
     now = timestamp or datetime.now(UTC).isoformat()
     if not reserve(ledger_path, snapshot, now):
